@@ -489,7 +489,7 @@ with st.expander("Vendors auto-matched from imported mappings", expanded=False):
                 )
                 st.session_state.imported_vendor_map_v4[vendor] = selected
 
-with st.expander("Auto-categorised low-value vendors", expanded=False):
+with st.expander("Uncategorised Low-value Vendors", expanded=False):
     if low_value_df.empty:
         st.info("No low-value vendors fell below the cutoff.")
     else:
