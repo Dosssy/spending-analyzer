@@ -1,4 +1,5 @@
 import io
+import math
 from pathlib import Path
 
 import matplotlib.dates as mdates
@@ -52,7 +53,7 @@ def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def read_uploaded_file(file_bytes: bytes, filename: str) -> pd.DataFrame:
+def read_single_file(file_bytes: bytes, filename: str) -> pd.DataFrame:
     suffix = Path(filename).suffix.lower()
     buffer = io.BytesIO(file_bytes)
 
@@ -61,9 +62,11 @@ def read_uploaded_file(file_bytes: bytes, filename: str) -> pd.DataFrame:
     elif suffix in {".xlsx", ".xls"}:
         df = pd.read_excel(buffer)
     else:
-        raise ValueError("Unsupported file type. Please upload CSV, XLSX, or XLS.")
+        raise ValueError(f"Unsupported file type for {filename}. Please upload CSV, XLSX, or XLS.")
 
-    return normalise_columns(df)
+    df = normalise_columns(df)
+    df["Source File"] = filename
+    return df
 
 
 def validate_required_columns(df: pd.DataFrame) -> None:
@@ -77,7 +80,6 @@ def validate_required_columns(df: pd.DataFrame) -> None:
         )
 
 
-@st.cache_data(show_spinner=False)
 def prepare_spending_data(raw_df: pd.DataFrame) -> pd.DataFrame:
     df = raw_df.copy()
     validate_required_columns(df)
@@ -111,7 +113,6 @@ def prepare_spending_data(raw_df: pd.DataFrame) -> pd.DataFrame:
     return spending_df
 
 
-@st.cache_data(show_spinner=False)
 def vendor_totals(spending_df: pd.DataFrame) -> pd.DataFrame:
     totals = (
         spending_df.groupby("Vendor Name", dropna=False)
@@ -244,13 +245,36 @@ def apply_final_categories(
 
 
 def vendor_summary_table(df: pd.DataFrame) -> pd.DataFrame:
-    return (
+    summary = (
         df.groupby(["Category", "Vendor Name"], dropna=False)["Spending Value"]
         .sum()
         .reset_index()
-        .sort_values(["Category", "Spending Value"], ascending=[True, False])
-        .reset_index(drop=True)
     )
+
+    category_totals = (
+        summary.groupby("Category", dropna=False)["Spending Value"]
+        .sum()
+        .reset_index()
+        .rename(columns={"Spending Value": "Category Total"})
+    )
+
+    summary = summary.merge(category_totals, on="Category", how="left")
+    summary["Percent of Category Spending"] = summary["Spending Value"] / summary["Category Total"] * 100
+
+    summary = summary.sort_values(
+        ["Category Total", "Category", "Spending Value", "Vendor Name"],
+        ascending=[False, True, False, True],
+    ).reset_index(drop=True)
+
+    summary = summary.rename(
+        columns={
+            "Category": "Category",
+            "Vendor Name": "Vendor",
+            "Spending Value": "Amount Spent",
+        }
+    )
+
+    return summary[["Category", "Vendor", "Amount Spent", "Percent of Category Spending"]]
 
 
 def weekly_spending_table(df: pd.DataFrame) -> pd.DataFrame:
@@ -279,15 +303,59 @@ def build_mapping_export(categorized_df: pd.DataFrame) -> pd.DataFrame:
     return export_df
 
 
+def make_weekly_plot(weekly_df: pd.DataFrame):
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(weekly_df["Week Start"], weekly_df["Spending Value"], linewidth=2.2)
+
+    ax.set_title("Weekly Spending", fontsize=14, pad=12)
+    ax.set_xlabel("Week Start")
+    ax.set_ylabel("Spending ($)")
+    ax.grid(True, alpha=0.25)
+
+    if not weekly_df.empty:
+        date_min = weekly_df["Week Start"].min()
+        date_max = weekly_df["Week Start"].max()
+        total_days = max((date_max - date_min).days, 1)
+        total_weeks = max(math.ceil(total_days / 7), 1)
+
+        if total_weeks <= 16:
+            ax.xaxis.set_major_locator(mdates.WeekdayLocator(interval=1))
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%d-%b"))
+        elif total_weeks <= 52:
+            interval = math.ceil(total_weeks / 12)
+            ax.xaxis.set_major_locator(mdates.WeekdayLocator(interval=interval))
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%d-%b"))
+        elif total_weeks <= 156:
+            interval = max(1, math.ceil(total_weeks / 10))
+            ax.xaxis.set_major_locator(mdates.WeekdayLocator(interval=interval))
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%d-%b-%y"))
+        else:
+            total_months = max(math.ceil(total_days / 30), 1)
+            interval = max(1, math.ceil(total_months / 12))
+            ax.xaxis.set_major_locator(mdates.MonthLocator(interval=interval))
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%b-%y"))
+
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    return fig
+
+
+def figure_to_png_bytes(fig) -> bytes:
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=200, bbox_inches="tight")
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 # =========================
 # SESSION STATE
 # =========================
-if "manual_vendor_map_v4" not in st.session_state:
-    st.session_state.manual_vendor_map_v4 = {}
-if "imported_vendor_map_v4" not in st.session_state:
-    st.session_state.imported_vendor_map_v4 = {}
-if "last_uploaded_filename_v4" not in st.session_state:
-    st.session_state.last_uploaded_filename_v4 = None
+if "manual_vendor_map_v5" not in st.session_state:
+    st.session_state.manual_vendor_map_v5 = {}
+if "imported_vendor_map_v5" not in st.session_state:
+    st.session_state.imported_vendor_map_v5 = {}
+if "uploaded_file_names_v5" not in st.session_state:
+    st.session_state.uploaded_file_names_v5 = []
 
 
 # =========================
@@ -295,25 +363,30 @@ if "last_uploaded_filename_v4" not in st.session_state:
 # =========================
 st.header("Upload")
 
-uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx", "xls"])
+uploaded_files = st.file_uploader(
+    "Upload one or more CSV / Excel files",
+    type=["csv", "xlsx", "xls"],
+    accept_multiple_files=True,
+)
 
-if uploaded_file is None:
-    st.info("Upload a transaction file to begin.")
+if not uploaded_files:
+    st.info("Upload one or more transaction files to begin.")
     st.stop()
 
-file_bytes = uploaded_file.getvalue()
+uploaded_names = sorted([file.name for file in uploaded_files])
+if st.session_state.uploaded_file_names_v5 != uploaded_names:
+    st.session_state.manual_vendor_map_v5 = {}
+    st.session_state.uploaded_file_names_v5 = uploaded_names
 
+raw_frames = []
 try:
-    raw_df = read_uploaded_file(file_bytes, uploaded_file.name)
+    for uploaded_file in uploaded_files:
+        raw_frames.append(read_single_file(uploaded_file.getvalue(), uploaded_file.name))
+    raw_df = pd.concat(raw_frames, ignore_index=True)
     spending_df = prepare_spending_data(raw_df)
 except Exception as exc:
     st.error(f"Error reading file: {exc}")
     st.stop()
-
-current_filename = uploaded_file.name
-if st.session_state.last_uploaded_filename_v4 != current_filename:
-    st.session_state.manual_vendor_map_v4 = {}
-    st.session_state.last_uploaded_filename_v4 = current_filename
 
 totals_df = vendor_totals(spending_df)
 total_spend = spending_df["Spending Value"].sum()
@@ -324,6 +397,9 @@ u2.metric("Number of Withdrawals", f"{len(spending_df):,}")
 u3.metric("Unique Vendors", f"{spending_df['Vendor Name'].nunique():,}")
 u4.metric("Total Spending", format_currency(total_spend))
 
+with st.expander("Uploaded files", expanded=False):
+    st.write("\n".join(f"- {name}" for name in uploaded_names))
+
 
 # =========================
 # CATEGORISATION SECTION
@@ -333,7 +409,7 @@ st.header("Categorisation")
 st.subheader("Import Vendor Mappings")
 st.caption("Copy two columns directly from Excel: vendor in the first column, category in the second. Paste them below.")
 
-with st.form("mapping_import_form_v4"):
+with st.form("mapping_import_form_v5"):
     mapping_text = st.text_area(
         "Import Vendor Mappings",
         height=180,
@@ -352,7 +428,7 @@ if apply_mapping_button:
         matched_map = {k: v for k, v in parsed_map.items() if k in current_vendors}
         unmatched_pasted = [k for k in parsed_map.keys() if k not in current_vendors]
 
-        st.session_state.imported_vendor_map_v4.update(matched_map)
+        st.session_state.imported_vendor_map_v5.update(matched_map)
 
         for warning in parse_warnings:
             st.warning(warning)
@@ -362,9 +438,12 @@ if apply_mapping_button:
             st.warning(f"{len(unmatched_pasted):,} pasted vendors did not match the current dataset exactly and were ignored.")
 
 manual_categories_default = DEFAULT_MANUAL_CATEGORIES
-if st.session_state.imported_vendor_map_v4:
-    imported_categories_sorted = sorted(set(st.session_state.imported_vendor_map_v4.values()))
-    manual_categories_default = "\n".join(imported_categories_sorted + [c for c in DEFAULT_MANUAL_CATEGORIES.splitlines() if c not in imported_categories_sorted])
+if st.session_state.imported_vendor_map_v5:
+    imported_categories_sorted = sorted(set(st.session_state.imported_vendor_map_v5.values()))
+    manual_categories_default = "\n".join(
+        imported_categories_sorted
+        + [c for c in DEFAULT_MANUAL_CATEGORIES.splitlines() if c not in imported_categories_sorted]
+    )
 
 st.subheader("Categories")
 manual_categories_text = st.text_area(
@@ -383,35 +462,35 @@ low_value_cutoff = st.number_input(
     label_visibility="collapsed",
 )
 
-category_options = parse_manual_categories(manual_categories_text, st.session_state.imported_vendor_map_v4)
+category_options = parse_manual_categories(manual_categories_text, st.session_state.imported_vendor_map_v5)
 
 manual_df, mapped_df, low_value_df = build_assignment_frame(
     totals_df=totals_df,
-    imported_map=st.session_state.imported_vendor_map_v4,
-    manual_map=st.session_state.manual_vendor_map_v4,
+    imported_map=st.session_state.imported_vendor_map_v5,
+    manual_map=st.session_state.manual_vendor_map_v5,
     low_value_cutoff=low_value_cutoff,
 )
 
 current_manual_vendors = set(manual_df["Vendor Name"].tolist())
-st.session_state.manual_vendor_map_v4 = {
-    k: v for k, v in st.session_state.manual_vendor_map_v4.items()
+st.session_state.manual_vendor_map_v5 = {
+    k: v for k, v in st.session_state.manual_vendor_map_v5.items()
     if k in current_manual_vendors
 }
 
 categorized_df = apply_final_categories(
     spending_df=spending_df,
-    imported_map=st.session_state.imported_vendor_map_v4,
-    manual_map=st.session_state.manual_vendor_map_v4,
+    imported_map=st.session_state.imported_vendor_map_v5,
+    manual_map=st.session_state.manual_vendor_map_v5,
     low_value_cutoff=low_value_cutoff,
 )
 
 uncategorised_spend = categorized_df.loc[categorized_df["Category"] == DEFAULT_CATEGORY, "Spending Value"].sum()
 auto_categorised_spend = categorized_df.loc[
-    categorized_df["Vendor Name"].isin(st.session_state.imported_vendor_map_v4.keys()), "Spending Value"
+    categorized_df["Vendor Name"].isin(st.session_state.imported_vendor_map_v5.keys()), "Spending Value"
 ].sum()
 low_value_spend = low_value_df["Amount"].sum()
 manually_categorised_spend = categorized_df.loc[
-    (~categorized_df["Vendor Name"].isin(st.session_state.imported_vendor_map_v4.keys()))
+    (~categorized_df["Vendor Name"].isin(st.session_state.imported_vendor_map_v5.keys()))
     & (categorized_df["Category"] != DEFAULT_CATEGORY)
     & (categorized_df["Category"] != LOW_VALUE_CATEGORY),
     "Spending Value",
@@ -421,7 +500,6 @@ vendors_uncategorised = categorized_df.loc[categorized_df["Category"] == DEFAULT
 
 st.subheader("Categorisation Stats")
 c1, c2, c3, c4, c5, c6 = st.columns(6)
-
 c1.metric("Spending Accounted for", f"{accounted_for_pct:.1f}%")
 c2.metric("Spending Auto Categorised", format_currency(auto_categorised_spend))
 c3.metric("Spending on Low Stakes Vendors", format_currency(low_value_spend))
@@ -443,7 +521,7 @@ with st.expander("Manual vendor assignment queue", expanded=True):
             vendor = row["Vendor Name"]
             amount = row["Amount"]
             share = row["Share of Total"]
-            current_value = st.session_state.manual_vendor_map_v4.get(vendor, DEFAULT_CATEGORY)
+            current_value = st.session_state.manual_vendor_map_v5.get(vendor, DEFAULT_CATEGORY)
 
             cols = st.columns([1.6, 1.8, 5.5, 2.3])
             cols[0].markdown(format_currency(amount))
@@ -454,10 +532,10 @@ with st.expander("Manual vendor assignment queue", expanded=True):
                     f"Category for {vendor}",
                     options=category_options,
                     index=category_options.index(current_value) if current_value in category_options else 0,
-                    key=f"manual_vendor_assignment_v4_{vendor}",
+                    key=f"manual_vendor_assignment_v5_{vendor}",
                     label_visibility="collapsed",
                 )
-                st.session_state.manual_vendor_map_v4[vendor] = selected
+                st.session_state.manual_vendor_map_v5[vendor] = selected
 
 with st.expander("Vendors auto-matched from imported mappings", expanded=False):
     if mapped_df.empty:
@@ -473,7 +551,7 @@ with st.expander("Vendors auto-matched from imported mappings", expanded=False):
             vendor = row["Vendor Name"]
             amount = row["Amount"]
             share = row["Share of Total"]
-            current_value = st.session_state.imported_vendor_map_v4.get(vendor, DEFAULT_CATEGORY)
+            current_value = st.session_state.imported_vendor_map_v5.get(vendor, DEFAULT_CATEGORY)
 
             cols = st.columns([1.6, 1.8, 5.5, 2.3])
             cols[0].markdown(format_currency(amount))
@@ -484,10 +562,10 @@ with st.expander("Vendors auto-matched from imported mappings", expanded=False):
                     f"Imported category for {vendor}",
                     options=category_options,
                     index=category_options.index(current_value) if current_value in category_options else 0,
-                    key=f"imported_vendor_assignment_v4_{vendor}",
+                    key=f"imported_vendor_assignment_v5_{vendor}",
                     label_visibility="collapsed",
                 )
-                st.session_state.imported_vendor_map_v4[vendor] = selected
+                st.session_state.imported_vendor_map_v5[vendor] = selected
 
 with st.expander("Uncategorised Low-value Vendors", expanded=False):
     if low_value_df.empty:
@@ -503,7 +581,7 @@ with st.expander("Uncategorised Low-value Vendors", expanded=False):
             vendor = row["Vendor Name"]
             amount = row["Amount"]
             share = row["Share of Total"]
-            current_value = LOW_VALUE_CATEGORY
+            current_value = st.session_state.manual_vendor_map_v5.get(vendor, LOW_VALUE_CATEGORY)
 
             cols = st.columns([1.6, 1.8, 5.5, 2.3])
             cols[0].markdown(format_currency(amount))
@@ -514,20 +592,16 @@ with st.expander("Uncategorised Low-value Vendors", expanded=False):
                     f"Low value category for {vendor}",
                     options=category_options,
                     index=category_options.index(current_value) if current_value in category_options else 0,
-                    key=f"low_value_vendor_assignment_v4_{vendor}",
+                    key=f"low_value_vendor_assignment_v5_{vendor}",
                     label_visibility="collapsed",
                 )
-                st.session_state.manual_vendor_map_v4[vendor] = selected
+                st.session_state.manual_vendor_map_v5[vendor] = selected
 
-
-# Reapply final categories after possible edits to mapped and low-value sections
-final_override_map = dict(st.session_state.manual_vendor_map_v4)
-for vendor, category in st.session_state.imported_vendor_map_v4.items():
+final_override_map = dict(st.session_state.manual_vendor_map_v5)
+for vendor, category in st.session_state.imported_vendor_map_v5.items():
     final_override_map[vendor] = category
 for vendor in low_value_df["Vendor Name"].tolist():
-    if vendor in st.session_state.manual_vendor_map_v4:
-        final_override_map[vendor] = st.session_state.manual_vendor_map_v4[vendor]
-    elif vendor not in st.session_state.imported_vendor_map_v4:
+    if vendor not in final_override_map:
         final_override_map[vendor] = LOW_VALUE_CATEGORY
 
 categorized_df = spending_df.copy()
@@ -539,47 +613,19 @@ categorized_df["Category"] = categorized_df["Vendor Name"].map(final_override_ma
 # =========================
 st.header("Results")
 
-with st.expander("Category Summary with Vendor Drilldown", expanded=False):
-    summary_df = vendor_summary_table(categorized_df)
-    category_totals = (
-        summary_df.groupby("Category", dropna=False)["Spending Value"]
-        .sum()
-        .reset_index()
-        .sort_values("Spending Value", ascending=False)
-        .reset_index(drop=True)
-    )
+summary_df = vendor_summary_table(categorized_df)
+weekly_df = weekly_spending_table(categorized_df)
+weekly_fig = make_weekly_plot(weekly_df)
+graph_png_bytes = figure_to_png_bytes(weekly_fig)
 
-    for _, category_row in category_totals.iterrows():
-        category = category_row["Category"]
-        category_total = category_row["Spending Value"]
-        category_vendors = summary_df[summary_df["Category"] == category].copy()
-        category_vendors["Percent of Category Spend"] = (
-            0.0 if category_total <= 0 else category_vendors["Spending Value"] / category_total * 100
-        )
-
-        with st.expander(f"{category} — {format_currency(category_total)}", expanded=False):
-            display_df = category_vendors[["Vendor Name", "Spending Value", "Percent of Category Spend"]].copy()
-            display_df["Spending Value"] = display_df["Spending Value"].round(2)
-            display_df["Percent of Category Spend"] = display_df["Percent of Category Spend"].round(2)
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
+with st.expander("Accountant-Ready Spending Table", expanded=False):
+    display_summary = summary_df.copy()
+    display_summary["Amount Spent"] = display_summary["Amount Spent"].round(2)
+    display_summary["Percent of Category Spending"] = display_summary["Percent of Category Spending"].round(2)
+    st.dataframe(display_summary, use_container_width=True, hide_index=True)
 
 with st.expander("Weekly Spending Graph", expanded=False):
-    weekly_df = weekly_spending_table(categorized_df)
-
-    fig, ax = plt.subplots(figsize=(12, 5))
-    ax.plot(weekly_df["Week Start"], weekly_df["Spending Value"], linewidth=2)
-
-    ax.set_title("Weekly Spending", fontsize=14, pad=12)
-    ax.set_xlabel("Week Start")
-    ax.set_ylabel("Spending ($)")
-    ax.grid(True, alpha=0.25)
-
-    ax.xaxis.set_major_locator(mdates.WeekdayLocator(interval=2))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d-%b"))
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-
-    st.pyplot(fig)
+    st.pyplot(weekly_fig)
 
 
 # =========================
@@ -587,23 +633,44 @@ with st.expander("Weekly Spending Graph", expanded=False):
 # =========================
 st.header("Downloads")
 
-download_df = categorized_df[
-    ["Transaction Date", "Amount", "Spending Value", "Vendor Name", "Category", "Code", "Details"]
+spending_results_df = categorized_df[
+    ["Transaction Date", "Amount", "Spending Value", "Vendor Name", "Category", "Code", "Details", "Source File"]
 ].copy()
 mapping_export_df = build_mapping_export(categorized_df)
 
-d1, d2 = st.columns(2)
+d1, d2, d3 = st.columns(3)
 with d1:
     st.download_button(
-        label="Download organised spending CSV",
-        data=make_download_csv(download_df),
-        file_name="organized_spending.csv",
-        mime="text/csv",
-    )
-with d2:
-    st.download_button(
-        label="Download updated vendor mapping CSV",
+        label="Download Vendor Mapping",
         data=make_download_csv(mapping_export_df),
         file_name="vendor_mapping_library.csv",
         mime="text/csv",
+        use_container_width=True,
     )
+with d2:
+    st.download_button(
+        label="Download Spending Results",
+        data=make_download_csv(spending_results_df),
+        file_name="organized_spending.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+with d3:
+    st.download_button(
+        label="Download Spending Over Time Graph",
+        data=graph_png_bytes,
+        file_name="weekly_spending_graph.png",
+        mime="image/png",
+        use_container_width=True,
+    )
+
+with st.expander("Preview Vendor Mapping Download", expanded=False):
+    st.dataframe(mapping_export_df, use_container_width=True, hide_index=True)
+
+with st.expander("Preview Spending Results Download", expanded=False):
+    preview_results = spending_results_df.copy()
+    preview_results["Spending Value"] = preview_results["Spending Value"].round(2)
+    st.dataframe(preview_results, use_container_width=True, hide_index=True)
+
+with st.expander("Preview Spending Over Time Graph Download", expanded=False):
+    st.pyplot(weekly_fig)
