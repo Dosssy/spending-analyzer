@@ -651,6 +651,10 @@ categorized_df["Category"] = categorized_df["Vendor Name"].map(final_override_ma
 st.header("Results")
 
 summary_display_df = build_summary_display(categorized_df)
+summary_export_df = summary_display_df.drop(columns=["_is_category"]).copy()
+summary_preview_df = summary_export_df.copy()
+summary_preview_df["Sum of Spending Value"] = summary_preview_df["Sum of Spending Value"].map(lambda x: f"${x:,.2f}")
+summary_preview_df["Spending Weights"] = summary_export_df["Spending Weights"].map(lambda x: f"{x:.2%}")
 weekly_df = weekly_spending_table(categorized_df)
 weekly_fig = make_weekly_plot(weekly_df)
 graph_png_bytes = figure_to_png_bytes(weekly_fig)
@@ -684,10 +688,8 @@ with preview_1:
 
 with preview_2:
     with st.container(border=True):
-        st.markdown("**Preview Spending Results**")
-        preview_results = spending_results_df.copy()
-        preview_results["Spending Value"] = preview_results["Spending Value"].round(2)
-        st.dataframe(preview_results.head(20), use_container_width=True, hide_index=True)
+        st.markdown("**Preview Summary**")
+        st.dataframe(summary_preview_df, use_container_width=True, hide_index=True)
 
 with preview_3:
     with st.container(border=True):
@@ -707,9 +709,9 @@ with download_1:
 
 with download_2:
     st.download_button(
-        label="Download Spending Results",
-        data=make_download_csv(spending_results_df),
-        file_name="organized_spending.csv",
+        label="Download Summary",
+        data=make_download_csv(summary_export_df),
+        file_name="spending_summary.csv",
         mime="text/csv",
         use_container_width=True,
     )
