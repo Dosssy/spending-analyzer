@@ -409,7 +409,7 @@ uncategorised_spend = categorized_df.loc[categorized_df["Category"] == DEFAULT_C
 auto_categorised_spend = categorized_df.loc[
     categorized_df["Vendor Name"].isin(st.session_state.imported_vendor_map_v4.keys()), "Spending Value"
 ].sum()
-low_value_spend = categorized_df.loc[categorized_df["Category"] == LOW_VALUE_CATEGORY, "Spending Value"].sum()
+low_value_spend = low_value_df["Amount"].sum()
 manually_categorised_spend = categorized_df.loc[
     (~categorized_df["Vendor Name"].isin(st.session_state.imported_vendor_map_v4.keys()))
     & (categorized_df["Category"] != DEFAULT_CATEGORY)
@@ -421,11 +421,12 @@ vendors_uncategorised = categorized_df.loc[categorized_df["Category"] == DEFAULT
 
 st.subheader("Categorisation Stats")
 c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("Spending Uncategorised ($)", format_currency(uncategorised_spend))
-c2.metric("Spending Auto Categorised ($)", format_currency(auto_categorised_spend))
+
+c1.metric("Spending Accounted for", f"{accounted_for_pct:.1f}%")
+c2.metric("Spending Auto Categorised", format_currency(auto_categorised_spend))
 c3.metric("Spending on Low Stakes Vendors", format_currency(low_value_spend))
-c4.metric("Spending Manually Categorised ($)", format_currency(manually_categorised_spend))
-c5.metric("Spending Accounted for (%)", f"{accounted_for_pct:.1f}%")
+c4.metric("Spending Manually Categorised", format_currency(manually_categorised_spend))
+c5.metric("Spending Uncategorised", format_currency(uncategorised_spend))
 c6.metric("Vendors Uncategorised", f"{vendors_uncategorised:,}")
 
 with st.expander("Manual vendor assignment queue", expanded=True):
