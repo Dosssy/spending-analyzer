@@ -1,18 +1,33 @@
-import io
+import pandas as pd
+import matplotlib.pyplot as plt
+import streamlit as st
 from pathlib import Path
 
-import matplotlib.pyplot as plt
-import pandas as pd
-import streamlit as st
+
+# =========================
+# PAGE SETUP
+# =========================
+st.set_page_config(
+    page_title="Spending Analyzer",
+    layout="wide",
+)
+
+st.title("Spending Analyzer")
+st.caption(
+    "Upload your bank transaction file, prioritise the biggest vendors first, "
+    "and stop when the remaining spending is too small to care about."
+)
 
 
-st.set_page_config(page_title="Spending Analyzer", layout="wide")
-
-
+# =========================
+# CONSTANTS
+# =========================
 REQUIRED_COLUMNS = ["Transaction Date", "Amount", "Code", "Details"]
-DEFAULT_CATEGORY = "Uncategorized"
 
 
+# =========================
+# HELPERS
+# =========================
 def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(col).strip() for col in df.columns]
@@ -59,7 +74,12 @@ def prepare_spending_data(raw_df: pd.DataFrame) -> pd.DataFrame:
     spending_df["Spending Value"] = spending_df["Amount"].abs()
     spending_df["Vendor Name"] = spending_df["Code"]
 
-    special_code_mask = spending_df["Code"].str.replace(r"\s+", " ", regex=True).str.strip().isin(["", "0991 C"])
+    special_code_mask = (
+        spending_df["Code"]
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+        .isin(["", "0991 C"])
+    )
     spending_df.loc[special_code_mask, "Vendor Name"] = spending_df.loc[special_code_mask, "Details"]
 
     spending_df["Vendor Name"] = spending_df["Vendor Name"].fillna("").astype(str).str.strip()
@@ -72,15 +92,64 @@ def prepare_spending_data(raw_df: pd.DataFrame) -> pd.DataFrame:
     return spending_df
 
 
-def apply_category_mapping(spending_df: pd.DataFrame, vendor_category_map: dict) -> pd.DataFrame:
-    df = spending_df.copy()
-    df["Category"] = df["Vendor Name"].map(vendor_category_map).fillna(DEFAULT_CATEGORY)
-    return df
+def vendor_totals(spending_df: pd.DataFrame) -> pd.DataFrame:
+    totals = (
+        spending_df.groupby("Vendor Name", dropna=False)["Spending Value"]
+        .sum()
+        .reset_index()
+        .sort_values("Spending Value", ascending=False)
+        .reset_index(drop=True)
+    )
+    return totals
+
+
+def apply_category_mapping(
+    spending_df: pd.DataFrame,
+    vendor_category_map: dict,
+    default_category: str,
+    low_value_cutoff: float,
+    low_value_category: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    totals_df = vendor_totals(spending_df)
+
+    manual_vendors_df = totals_df[totals_df["Spending Value"] > low_value_cutoff].copy()
+    auto_vendors_df = totals_df[totals_df["Spending Value"] <= low_value_cutoff].copy()
+
+    final_map = {}
+
+    for _, row in manual_vendors_df.iterrows():
+        vendor = row["Vendor Name"]
+        final_map[vendor] = vendor_category_map.get(vendor, default_category)
+
+    for _, row in auto_vendors_df.iterrows():
+        vendor = row["Vendor Name"]
+        final_map[vendor] = low_value_category
+
+    categorized_df = spending_df.copy()
+    categorized_df["Category"] = categorized_df["Vendor Name"].map(final_map).fillna(default_category)
+
+    return categorized_df, manual_vendors_df, auto_vendors_df
 
 
 def vendor_summary_table(df: pd.DataFrame) -> pd.DataFrame:
     summary = (
         df.groupby(["Category", "Vendor Name"], dropna=False)["Spending Value"]
+        .sum()
+        .reset_index()
+        .sort_values("Spending Value", ascending=False)
+        .reset_index(drop=True)
+    )
+    total = summary["Spending Value"].sum()
+    if total > 0:
+        summary["Percent of Total Spending"] = summary["Spending Value"] / total * 100
+    else:
+        summary["Percent of Total Spending"] = 0.0
+    return summary
+
+
+def category_summary_table(df: pd.DataFrame) -> pd.DataFrame:
+    summary = (
+        df.groupby("Category", dropna=False)["Spending Value"]
         .sum()
         .reset_index()
         .sort_values("Spending Value", ascending=False)
@@ -108,10 +177,17 @@ def make_download_csv(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
 
 
-st.title("Spending Analyzer")
-st.write("Upload your bank transaction file, assign categories to vendors, and view your spending instantly.")
+def format_currency(value: float) -> str:
+    return f"${value:,.2f}"
 
-uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx", "xls"])
+
+# =========================
+# APP
+# =========================
+uploaded_file = st.file_uploader(
+    "Upload CSV or Excel file",
+    type=["csv", "xlsx", "xls"]
+)
 
 if uploaded_file is None:
     st.info("Upload a transaction file to begin.")
@@ -126,51 +202,151 @@ except Exception as exc:
 
 st.success("File uploaded and processed successfully.")
 
+# =========================
+# QUICK CHECK
+# =========================
 st.subheader("Quick Check")
-col1, col2, col3 = st.columns(3)
-col1.metric("Raw Rows", f"{len(raw_df):,}")
-col2.metric("Spending Rows", f"{len(spending_df):,}")
-col3.metric("Unique Vendors", f"{spending_df['Vendor Name'].nunique():,}")
+qc1, qc2, qc3, qc4 = st.columns(4)
+qc1.metric("Raw Rows", f"{len(raw_df):,}")
+qc2.metric("Spending Rows", f"{len(spending_df):,}")
+qc3.metric("Unique Vendors", f"{spending_df['Vendor Name'].nunique():,}")
+qc4.metric("Total Spending", format_currency(spending_df["Spending Value"].sum()))
 
-unique_vendors = sorted(spending_df["Vendor Name"].dropna().unique().tolist())
+# =========================
+# CONTROLS
+# =========================
+st.subheader("Category Controls")
 
-st.subheader("Assign Categories")
-st.caption("Set a category for each vendor. Leave blank to keep it as Uncategorized.")
+control_col_1, control_col_2 = st.columns(2)
 
-preset_categories_text = st.text_input(
-    "Preset categories (comma separated)",
-    value="Groceries, Eating Out, Transport, Bills, Health, Entertainment, Shopping, Vape, Cafe, Other"
-)
+with control_col_1:
+    preset_categories_text = st.text_input(
+        "Preset categories (comma separated)",
+        value="Groceries, Eating Out, Transport, Bills, Health, Entertainment, Shopping, Vape, Cafe, Miscellaneous, Other"
+    )
+
+    default_category = st.text_input(
+        "Default category for untouched vendors",
+        value="Uncategorised"
+    )
+
+with control_col_2:
+    low_value_cutoff = st.number_input(
+        "Auto-category cutoff amount",
+        min_value=0.0,
+        value=4.0,
+        step=1.0,
+        help="Any vendor with total spending at or below this amount will be automatically categorized."
+    )
+
+    low_value_category = st.text_input(
+        "Automatic category for low-value vendors",
+        value="Miscellaneous"
+    )
+
 preset_categories = [x.strip() for x in preset_categories_text.split(",") if x.strip()]
-category_options = [""] + preset_categories
 
-if "vendor_category_map" not in st.session_state:
-    st.session_state.vendor_category_map = {}
+category_options = []
+for category in [default_category] + preset_categories + [low_value_category]:
+    if category not in category_options:
+        category_options.append(category)
 
-with st.expander("Vendor category editor", expanded=True):
-    for vendor in unique_vendors:
-        current_value = st.session_state.vendor_category_map.get(vendor, "")
-        selected = st.selectbox(
-            f"{vendor}",
-            options=category_options,
-            index=category_options.index(current_value) if current_value in category_options else 0,
-            key=f"vendor_{vendor}"
-        )
-        if selected == "":
-            st.session_state.vendor_category_map.pop(vendor, None)
-        else:
-            st.session_state.vendor_category_map[vendor] = selected
+totals_df = vendor_totals(spending_df)
+manual_queue_df = totals_df[totals_df["Spending Value"] > low_value_cutoff].copy()
+auto_queue_df = totals_df[totals_df["Spending Value"] <= low_value_cutoff].copy()
 
-categorized_df = apply_category_mapping(spending_df, st.session_state.vendor_category_map)
+if "vendor_category_map_v2" not in st.session_state:
+    st.session_state.vendor_category_map_v2 = {}
 
-summary_df = vendor_summary_table(categorized_df)
+# Clean out stale vendors if a new file is uploaded
+current_vendor_set = set(manual_queue_df["Vendor Name"].tolist())
+st.session_state.vendor_category_map_v2 = {
+    k: v for k, v in st.session_state.vendor_category_map_v2.items()
+    if k in current_vendor_set
+}
+
+# =========================
+# PRIORITY QUEUE SUMMARY
+# =========================
+st.subheader("Vendor Prioritisation Queue")
+
+pq1, pq2, pq3, pq4 = st.columns(4)
+pq1.metric("Manual Vendors Remaining", f"{len(manual_queue_df):,}")
+pq2.metric("Auto-Categorised Small Vendors", f"{len(auto_queue_df):,}")
+pq3.metric("Spend in Manual Queue", format_currency(manual_queue_df["Spending Value"].sum()))
+pq4.metric("Spend Auto-Sent to Tail Bucket", format_currency(auto_queue_df["Spending Value"].sum()))
+
+st.caption(
+    "Vendors are sorted from largest spending to smallest. "
+    "Anything at or below the cutoff is automatically assigned to the low-value category."
+)
+
+# =========================
+# CATEGORY ASSIGNMENT UI
+# =========================
+st.subheader("Assign Categories to Highest-Value Vendors First")
+
+with st.expander("Manual vendor assignment queue", expanded=True):
+    for _, row in manual_queue_df.iterrows():
+        vendor = row["Vendor Name"]
+        spend_amount = row["Spending Value"]
+        current_value = st.session_state.vendor_category_map_v2.get(vendor, default_category)
+
+        left, middle, right = st.columns([2, 5, 2])
+
+        with left:
+            selected = st.selectbox(
+                "Category",
+                options=category_options,
+                index=category_options.index(current_value) if current_value in category_options else 0,
+                key=f"vendor_category_{vendor}",
+                label_visibility="collapsed"
+            )
+
+        with middle:
+            st.markdown(f"**{vendor}**")
+
+        with right:
+            st.markdown(f"**{format_currency(spend_amount)}**")
+
+        st.session_state.vendor_category_map_v2[vendor] = selected
+
+if len(auto_queue_df) > 0:
+    with st.expander("Auto-categorised low-value vendors", expanded=False):
+        auto_display_df = auto_queue_df.copy()
+        auto_display_df["Assigned Category"] = low_value_category
+        auto_display_df["Spending Value"] = auto_display_df["Spending Value"].round(2)
+        st.dataframe(auto_display_df, use_container_width=True, hide_index=True)
+
+# =========================
+# APPLY CATEGORIES
+# =========================
+categorized_df, manual_vendors_df, auto_vendors_df = apply_category_mapping(
+    spending_df=spending_df,
+    vendor_category_map=st.session_state.vendor_category_map_v2,
+    default_category=default_category,
+    low_value_cutoff=low_value_cutoff,
+    low_value_category=low_value_category,
+)
+
+vendor_summary_df = vendor_summary_table(categorized_df)
+category_summary_df = category_summary_table(categorized_df)
 weekly_df = weekly_spending_table(categorized_df)
 
+# =========================
+# RESULTS
+# =========================
 st.subheader("Result A: Vendor Summary Table")
-display_summary = summary_df.copy()
-display_summary["Spending Value"] = display_summary["Spending Value"].round(2)
-display_summary["Percent of Total Spending"] = display_summary["Percent of Total Spending"].round(2)
-st.dataframe(display_summary, use_container_width=True, hide_index=True)
+display_vendor_summary = vendor_summary_df.copy()
+display_vendor_summary["Spending Value"] = display_vendor_summary["Spending Value"].round(2)
+display_vendor_summary["Percent of Total Spending"] = display_vendor_summary["Percent of Total Spending"].round(2)
+st.dataframe(display_vendor_summary, use_container_width=True, hide_index=True)
+
+st.subheader("Category Summary")
+display_category_summary = category_summary_df.copy()
+display_category_summary["Spending Value"] = display_category_summary["Spending Value"].round(2)
+display_category_summary["Percent of Total Spending"] = display_category_summary["Percent of Total Spending"].round(2)
+st.dataframe(display_category_summary, use_container_width=True, hide_index=True)
 
 st.subheader("Result B: Weekly Spending Plot")
 fig, ax = plt.subplots(figsize=(10, 4))
@@ -182,19 +358,22 @@ plt.xticks(rotation=45)
 plt.tight_layout()
 st.pyplot(fig)
 
-st.subheader("Download Organized Spending")
+# =========================
+# DOWNLOAD
+# =========================
+st.subheader("Download Organised Spending")
 download_df = categorized_df[
     ["Transaction Date", "Amount", "Spending Value", "Vendor Name", "Category", "Code", "Details"]
 ].copy()
 
 st.download_button(
-    label="Download organized spending CSV",
+    label="Download organised spending CSV",
     data=make_download_csv(download_df),
     file_name="organized_spending.csv",
     mime="text/csv",
 )
 
-with st.expander("Preview organized transactions"):
+with st.expander("Preview organised transactions"):
     preview_df = download_df.copy()
     preview_df["Spending Value"] = preview_df["Spending Value"].round(2)
     st.dataframe(preview_df, use_container_width=True, hide_index=True)
